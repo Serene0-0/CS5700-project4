@@ -11,6 +11,9 @@ class Receiver:
 
         self.remote_host = None
         self.remote_port = None
+        self.expected_seq = 0
+        self.buffer = {}
+        self.received_data = set() # use set here because time complexity is lower
 
     def send(self, message):
         self.log("Sent message %s" % json.dumps(message))
@@ -42,18 +45,28 @@ class Receiver:
             for conn in socks:
                 msg = self.recv(conn)
 
-                if msg:
-                    # Print out the data to stdout
-                    print(msg["data"], end='', flush=True)
-
-                    # Always send back an ack
-                    self.send({ "type": "ack", "seq": msg["seq"] })
-
-
-        return
+                if msg and msg.get("type") == "msg":
+                    seq = msg["seq"]
+                    if seq not in self.received_data:
+                        # Always send back an ack
+                        self.send({"type": "ack", "seq": seq})
+                        self.received_data.add(seq)
+                        self.buffer[seq] = msg["data"]
+                        # Check if the msg received in order(is expected)
+                        # true: print out; else: add it to buffer
+                        if seq == self.expected_seq:
+                            # Print out the data to stdout
+                            print(msg["data"], end='', flush=True)
+                            del self.buffer[seq]
+                            self.expected_seq += 1
+                            # Check if buffer contains the msg with expected sequence number
+                            while self.expected_seq in self.buffer:
+                                print(self.buffer[self.expected_seq], end='', flush=True)
+                                del self.buffer[self.expected_seq]
+                                self.expected_seq += 1
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(description='receive data')
     args = parser.parse_args()
-    sender = Receiver()
-    sender.run()
+    receiver = Receiver()
+    receiver.run()
