@@ -16,8 +16,6 @@ class Sender:
         self.remote_port = None
         self.window_size = 4
         self.unack_data = {}
-        self.next_pointer = 0
-        self.first_pointer = 0
         self.timeout = 0.5
 
     def log(self, message):
@@ -64,22 +62,20 @@ class Sender:
 
                         if ack_data_seq in self.unack_data:
                             del self.unack_data[ack_data_seq]
-                            self.first_pointer = min(self.unack_data.keys(), default=self.first_pointer + 1)
 
                 elif conn == sys.stdin:
                     # limit the unacknowledged packet to window size
-                    while (not finished) and seq - self.first_pointer + 1 <= self.window_size:
-                        if len(self.unack_data) >= self.window_size:
-                            continue
+                    if len(self.unack_data) >= self.window_size:
+                        continue
 
-                        data = sys.stdin.read(DATA_SIZE)
-                        if len(data) == 0:
-                            finished = True
-                            break
+                    data = sys.stdin.read(DATA_SIZE)
+                    if len(data) == 0:
+                        finished = True
+                        break
 
-                        msg = { "type": "msg", "data": data, "seq": seq }
-                        self.send(msg)
-                        seq += 1
+                    msg = { "type": "msg", "data": data, "seq": seq }
+                    self.send(msg)
+                    seq += 1
 
             if finished and len(self.unack_data) == 0:
                 self.log("All done!")
