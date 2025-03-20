@@ -1,8 +1,10 @@
 #!/usr/bin/env -S python3 -u
 
 import argparse, socket, time, json, select, struct, sys, math
+import zlib
 
 DATA_SIZE = 1375
+FACTOR = 0.125
 
 class Sender:
     def __init__(self, host, port):
@@ -17,17 +19,28 @@ class Sender:
         self.window_size = 4
         self.unack_data = {}
         self.timeout = 0.5
+        self.estimated_rtt = 0.5
+        self.rtt_times = {}
 
     def log(self, message):
         sys.stderr.write(message + "\n")
         sys.stderr.flush()
 
     def send(self, message):
+        """
+        Calculate the checksum and add the attribute to the msg & send the msg
+        :param message:
+        """
+        if "checksum" in message:
+            del message["checksum"]
+
+        message["checksum"] = self.compute_checksum(message)
+
         self.log("Sending message '%s'" % json.dumps(message))
         self.socket.sendto(json.dumps(message).encode("utf-8"), (self.host, self.port))
         # record sent but unacknowledged msg
         self.unack_data[message["seq"]] = {"msg": message, "last_sent": time.time()}
-        self.log(f"Unacknowledged data after sending: {list(self.unack_data.keys())}")
+        self.log(f"[DEBUG]Unacknowledged data after sending: {list(self.unack_data.keys())}")
 
     def recv(self, socket):
         data, addr = socket.recvfrom(65535)
@@ -42,8 +55,13 @@ class Sender:
             self.log("Error:  Received response from unexpected remote; ignoring")
             return None
         else:
-            self.log("Received message %s" % data)
-            return json.loads(data.decode("utf-8"))
+            try:
+                message = json.loads(data.decode("utf-8"))
+                self.log("Received message %s" % data)
+                return message
+            except json.JSONDecodeError as e:
+                self.log(f"JSON decode error: {e}. Packet dropped.")
+                return None
 
     def run(self):
         seq = 0
@@ -55,13 +73,12 @@ class Sender:
             for conn in socks:
                 if conn == self.socket:
                     data = self.recv(conn)
-                    # delete the acknowledged message from unack_data dictionary and move the base pointer to the next message
-                    if data and data.get("type") == "ack":
-                        ack_data_seq = data["seq"]
-                        self.log(f"ACK received for seq={ack_data_seq}")
 
-                        if ack_data_seq in self.unack_data:
-                            del self.unack_data[ack_data_seq]
+                    if data is None:
+                        continue
+
+                    if not self.is_corrupted(data):
+                        self.deal_msg_type(data)
 
                 elif conn == sys.stdin:
                     # limit the unacknowledged packet to window size
@@ -83,11 +100,80 @@ class Sender:
 
             # retransmit the timeout messages
             now = time.time()
-            for sequence in self.unack_data:
+            for sequence in list(self.unack_data.keys()):
+                msg = self.unack_data[sequence]["msg"]
                 if now - self.unack_data[sequence]["last_sent"] > self.timeout:
                     self.log(f"Retransmitting message: seq: {sequence}")
-                    self.send(self.unack_data[sequence]["msg"])
-                    self.unack_data[sequence]["last_sent"] = now
+                    self.send(msg)
+                    self.log(f"[DEBUG] Retransmitting with message: {json.dumps(msg, sort_keys=True)}")
+
+
+    def handle_ack(self, message):
+        """
+        Handle the ACK message, delete from the unack data.
+        :param message:
+        """
+        if "seq" not in message:
+            return
+
+        data_seq = message["seq"]
+        self.log("[DEBUG] Entering dealing with the ack msg")
+        self.log(f"ACK received for seq={data_seq}")
+        if data_seq in self.unack_data:
+            del self.unack_data[data_seq]
+
+
+    def handle_corrupted(self, message):
+        """
+        Handle the corrupted message and retransmit.
+        :param message:
+        """
+        if "seq" not in message:
+            return
+
+        data_seq = message["seq"]
+        self.log(f"Received corrupted NACK for seq {data_seq}, retransmitting...")
+        if data_seq in self.unack_data:
+            self.send(self.unack_data[data_seq]["msg"])
+
+
+    def deal_msg_type(self, message):
+        msg_type = message["type"]
+        if msg_type == "ack":
+            self.handle_ack(message)
+        elif msg_type == "corrupted":
+            self.handle_corrupted(message)
+
+
+    def compute_checksum(self, message):
+        """
+        Compute the checksum for the message
+        :param self:
+        :param message:
+        :return: the checksum
+        """
+        msg_json = json.dumps(message, sort_keys=True).encode("utf-8")
+        return zlib.crc32(msg_json)
+
+
+    def is_corrupted(self, message):
+        """
+        JSON decode and verify a packet by comparing checksums.
+        :param message:
+        :return:
+        """
+        if "checksum" not in message:
+            self.log("Error: Received packet missing checksum; ignoring")
+            return True
+
+        received_checksum = message["checksum"]
+        del message["checksum"]
+        computed_checksum = self.compute_checksum(message)
+
+        if received_checksum != computed_checksum:
+            self.log("Error:  Received corrupted packet; ignoring")
+            return True
+        return False
 
 
 if __name__ == "__main__":

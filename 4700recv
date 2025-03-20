@@ -1,6 +1,8 @@
 #!/usr/bin/env -S python3 -u
 
 import argparse, socket, time, json, select, struct, sys, math
+import zlib
+
 
 class Receiver:
     def __init__(self):
@@ -16,6 +18,7 @@ class Receiver:
         self.received_data = set() # use set here because time complexity is lower
 
     def send(self, message):
+        message["checksum"] = self.compute_checksum(message)
         self.log("Sent message %s" % json.dumps(message))
         self.socket.sendto(json.dumps(message).encode("utf-8"), (self.remote_host, self.remote_port))
 
@@ -31,9 +34,17 @@ class Receiver:
         if addr != (self.remote_host, self.remote_port):
             self.log("Error:  Received response from unexpected remote; ignoring")
             return None
+        elif not data:
+            self.log("Error:  Received empty packet; ignoring")
+            return None
         else:
-            self.log("Received message %s" % data.decode("utf-8"))
-            return json.loads(data.decode("utf-8"))
+            try:
+                message = json.loads(data.decode("utf-8"))
+                self.log("Received message %s" % data)
+                return message
+            except json.JSONDecodeError as e:
+                self.log(f"JSON decode error: {e}. Packet dropped.")
+                return None
 
     def log(self, message):
         sys.stderr.write(message + "\n")
@@ -45,11 +56,21 @@ class Receiver:
             for conn in socks:
                 msg = self.recv(conn)
 
+                if msg is None:
+                    continue
+
+                if "seq" not in msg:
+                    continue
+
+                if self.is_corrupted(msg):
+                    self.send({"type": "corrupted", "seq": msg["seq"], "timestamp": time.time()})
+                    continue
+
                 if msg and msg.get("type") == "msg":
                     seq = msg["seq"]
+                    # Always send back an ack
+                    self.send({"type": "ack", "seq": seq})
                     if seq not in self.received_data:
-                        # Always send back an ack
-                        self.send({"type": "ack", "seq": seq})
                         self.received_data.add(seq)
                         self.buffer[seq] = msg["data"]
                         # Check if the msg received in order(is expected)
@@ -64,6 +85,39 @@ class Receiver:
                                 print(self.buffer[self.expected_seq], end='', flush=True)
                                 del self.buffer[self.expected_seq]
                                 self.expected_seq += 1
+
+
+    def compute_checksum(self, message):
+        """
+        Compute the checksum for the message
+        :param self:
+        :param message:
+        :return: the checksum
+        """
+        msg_json = json.dumps(message, sort_keys=True).encode("utf-8")
+        return zlib.crc32(msg_json)
+
+
+    def is_corrupted(self, message):
+        """
+        JSON decode and verify a packet by comparing checksums.
+        :param message:
+        :return:
+        """
+        if "checksum" not in message:
+            self.log("Error: Received packet missing checksum; ignoring")
+            return True
+
+        received_checksum = message["checksum"]
+        del message["checksum"]
+        computed_checksum = self.compute_checksum(message)
+
+        if received_checksum != computed_checksum:
+            self.log("Error:  Received corrupted packet; ignoring")
+            return True
+
+        return False
+
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(description='receive data')
