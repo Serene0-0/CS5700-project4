@@ -20,7 +20,7 @@ class Sender:
         self.unack_data = {}
         self.timeout = 0.5
         self.estimated_rtt = 0.5
-        self.rtt_times = {}
+        self.ssthresh = 16
 
     def log(self, message):
         sys.stderr.write(message + "\n")
@@ -105,7 +105,6 @@ class Sender:
                 if now - self.unack_data[sequence]["last_sent"] > self.timeout:
                     self.log(f"Retransmitting message: seq: {sequence}")
                     self.send(msg)
-                    self.log(f"[DEBUG] Retransmitting with message: {json.dumps(msg, sort_keys=True)}")
 
 
     def handle_ack(self, message):
@@ -117,9 +116,10 @@ class Sender:
             return
 
         data_seq = message["seq"]
-        self.log("[DEBUG] Entering dealing with the ack msg")
+        ack_timestamp = message["timestamp"]
         self.log(f"ACK received for seq={data_seq}")
         if data_seq in self.unack_data:
+            self.compute_timeout(ack_timestamp, data_seq)
             del self.unack_data[data_seq]
 
 
@@ -174,6 +174,16 @@ class Sender:
             self.log("Error:  Received corrupted packet; ignoring")
             return True
         return False
+
+
+    def compute_timeout(self, ack_timestamp, seq):
+        send_time = self.unack_data[seq]["last_sent"]
+
+        if send_time:
+            rtt = ack_timestamp - send_time
+            self.estimated_rtt = (1 - FACTOR) * self.estimated_rtt + FACTOR * rtt
+            self.timeout = 2 * self.estimated_rtt
+            self.log(f"RTT update: {self.estimated_rtt: .4f}s, timeout: {self.timeout: .4f}s")
 
 
 if __name__ == "__main__":
