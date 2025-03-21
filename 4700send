@@ -16,13 +16,18 @@ class Sender:
 
         self.remote_host = None
         self.remote_port = None
-        self.window_size = 4
+        self.window_size = 1
         self.unack_data = {}
-        self.timeout = 0.5
+        self.timeout = 1
         self.estimated_rtt = 0.5
+        self.fluctuation = 0.25
         self.ssthresh = 16
 
     def log(self, message):
+        """
+        Write a message to the log file
+        :param message:
+        """
         sys.stderr.write(message + "\n")
         sys.stderr.flush()
 
@@ -40,9 +45,13 @@ class Sender:
         self.socket.sendto(json.dumps(message).encode("utf-8"), (self.host, self.port))
         # record sent but unacknowledged msg
         self.unack_data[message["seq"]] = {"msg": message, "last_sent": time.time()}
-        self.log(f"[DEBUG]Unacknowledged data after sending: {list(self.unack_data.keys())}")
 
     def recv(self, socket):
+        """
+        Receive data and load the message in json
+        :param socket:
+        :return:
+        """
         data, addr = socket.recvfrom(65535)
 
         # Grab the remote host/port if we don't already have it
@@ -103,6 +112,14 @@ class Sender:
             for sequence in list(self.unack_data.keys()):
                 msg = self.unack_data[sequence]["msg"]
                 if now - self.unack_data[sequence]["last_sent"] > self.timeout:
+                    self.unack_data[sequence]["retransmit_count"] = self.unack_data[sequence].get("retransmit_count",
+                                                                                                  0) + 1
+                    if self.unack_data[sequence]["retransmit_count"] >= 5:
+                        self.log(f"Too many retransmissions for seq {sequence}, reducing window size.")
+                        self.handle_window_size()
+                        self.unack_data[sequence]["last_sent"] = time.time()
+                        continue
+
                     self.log(f"Retransmitting message: seq: {sequence}")
                     self.send(msg)
 
@@ -118,9 +135,18 @@ class Sender:
         data_seq = message["seq"]
         ack_timestamp = message["timestamp"]
         self.log(f"ACK received for seq={data_seq}")
+
         if data_seq in self.unack_data:
             self.compute_timeout(ack_timestamp, data_seq)
             del self.unack_data[data_seq]
+
+            # adjust window size
+            # slow start
+            if self.window_size < self.ssthresh:
+                self.window_size += 1
+            else:
+                # avoid congestion
+                self.window_size += 1 / self.window_size
 
 
     def handle_corrupted(self, message):
@@ -136,6 +162,7 @@ class Sender:
         if data_seq in self.unack_data:
             self.send(self.unack_data[data_seq]["msg"])
 
+        self.handle_window_size()
 
     def deal_msg_type(self, message):
         msg_type = message["type"]
@@ -177,13 +204,31 @@ class Sender:
 
 
     def compute_timeout(self, ack_timestamp, seq):
+        """
+        Update the timeout setting by calculating the RTT
+        :param ack_timestamp: timestamp of the ACK message
+        :param seq: sequence number of message
+        :return:
+        """
         send_time = self.unack_data[seq]["last_sent"]
 
         if send_time:
             rtt = ack_timestamp - send_time
             self.estimated_rtt = (1 - FACTOR) * self.estimated_rtt + FACTOR * rtt
-            self.timeout = 2 * self.estimated_rtt
+            self.fluctuation = (1 - FACTOR) * self.fluctuation + FACTOR * abs(rtt - self.estimated_rtt)
+            self.timeout = self.estimated_rtt + 4 * self.fluctuation
             self.log(f"RTT update: {self.estimated_rtt: .4f}s, timeout: {self.timeout: .4f}s")
+
+
+    def handle_window_size(self):
+        """
+        Adjust the window size by observing the bandwidth
+        :return:
+        """
+        self.ssthresh = max(4, self.window_size // 2)
+        self.window_size = max(1, self.window_size // 2)
+        self.window_size = 1
+
 
 
 if __name__ == "__main__":
